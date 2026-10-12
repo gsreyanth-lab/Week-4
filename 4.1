@@ -1,0 +1,382 @@
+/*
+ * weka_cluster_flow.c
+ * Clustering (SimpleKMeans, EM, DBSCAN), cluster evaluation (SSE, centroids),
+ * ZeroR baseline and a Knowledge-Flow style pipeline, all in C, on iris.
+ *
+ * Compile: gcc -O2 -o weka_cf weka_cluster_flow.c -lm
+ * Run    : ./weka_cf iris.csv
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <float.h>
+
+#define MAXN 200
+#define NA   4
+#define NC   3
+
+static double X[MAXN][NA];     /* original values            */
+static double Z[MAXN][NA];     /* min-max normalised values  */
+static int    Y[MAXN];         /* class labels               */
+static int    n = 0, ncls = 0;
+static double mn[NA], mx[NA];
+static char   cname[NC][24];
+static const char *aname[NA] = {"sepallength", "sepalwidth", "petallength", "petalwidth"};
+
+/* ----------------------------- loader ------------------------------------ */
+static int load_csv(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[256], lab[64];
+    while (fgets(line, sizeof line, f) && n < MAXN) {
+        double v[NA];
+        if (sscanf(line, "%lf,%lf,%lf,%lf,%63[^\r\n]", &v[0], &v[1], &v[2], &v[3], lab) != 5) continue;
+        int c;
+        for (c = 0; c < ncls; c++) if (!strcmp(cname[c], lab)) break;
+        if (c == ncls) strcpy(cname[ncls++], lab);
+        for (int a = 0; a < NA; a++) X[n][a] = v[a];
+        Y[n++] = c;
+    }
+    fclose(f);
+    for (int a = 0; a < NA; a++) {
+        mn[a] = DBL_MAX; mx[a] = -DBL_MAX;
+        for (int i = 0; i < n; i++) { if (X[i][a] < mn[a]) mn[a] = X[i][a]; if (X[i][a] > mx[a]) mx[a] = X[i][a]; }
+        for (int i = 0; i < n; i++) Z[i][a] = (X[i][a] - mn[a]) / (mx[a] - mn[a]);
+    }
+    return n;
+}
+
+/* ------------------- classes-to-clusters evaluation ----------------------- */
+static void classes_to_clusters(const int *asg, int k) {
+    int tab[NC][NC] = {{0}};
+    for (int i = 0; i < n; i++) tab[Y[i]][asg[i]]++;
+    static const int P[6][3] = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
+    int bp = 0, bm = -1;
+    for (int p = 0; p < 6; p++) {
+        int m = 0;
+        for (int c = 0; c < k; c++) m += tab[c][P[p][c]];
+        if (m > bm) { bm = m; bp = p; }
+    }
+    printf("\nClasses to Clusters:\n\n");
+    for (int c = 0; c < k; c++) printf("%8d", c);
+    printf("   <-- assigned to cluster\n");
+    for (int c = 0; c < ncls; c++) {
+        for (int j = 0; j < k; j++) printf("%8d", tab[c][P[bp][j]]);
+        printf(" | %s\n", cname[c]);
+    }
+    printf("\nIncorrectly clustered instances : %d  (%.4f %%)\n", n - bm, 100.0 * (n - bm) / n);
+}
+
+/* ============================ SimpleKMeans ================================ */
+static double d2z(const double *a, const double *b) {
+    double s = 0;
+    for (int j = 0; j < NA; j++) s += (a[j] - b[j]) * (a[j] - b[j]);
+    return s;
+}
+
+/* runs on normalised data; returns SSE (normalised units) */
+static double kmeans_once(int k, int seed, double cen[][NA], int *asg, int *iters) {
+    srand(seed);
+    int pick[10];
+    for (int c = 0; c < k; c++) {
+        int ok;
+        do { pick[c] = rand() % n; ok = 1; for (int p = 0; p < c; p++) if (pick[p] == pick[c]) ok = 0; } while (!ok);
+        memcpy(cen[c], Z[pick[c]], sizeof(double) * NA);
+    }
+    for (int i = 0; i < n; i++) asg[i] = -1;
+    int changed = 1; *iters = 0;
+    while (changed && *iters < 500) {
+        changed = 0; (*iters)++;
+        for (int i = 0; i < n; i++) {
+            int b = 0; double bd = DBL_MAX;
+            for (int c = 0; c < k; c++) { double d = d2z(Z[i], cen[c]); if (d < bd) { bd = d; b = c; } }
+            if (asg[i] != b) { asg[i] = b; changed = 1; }
+        }
+        double sum[10][NA] = {{0}}; int cnt[10] = {0};
+        for (int i = 0; i < n; i++) { cnt[asg[i]]++; for (int j = 0; j < NA; j++) sum[asg[i]][j] += Z[i][j]; }
+        for (int c = 0; c < k; c++) if (cnt[c]) for (int j = 0; j < NA; j++) cen[c][j] = sum[c][j] / cnt[c];
+    }
+    double sse = 0;
+    for (int i = 0; i < n; i++) sse += d2z(Z[i], cen[asg[i]]);
+    return sse;
+}
+
+static double kmeans_best(int k, double cen[][NA], int *asg, int *iters) {
+    double best = DBL_MAX, c2[10][NA]; int a2[MAXN], it;
+    for (int seed = 1; seed <= 20; seed++) {
+        double s = kmeans_once(k, seed, c2, a2, &it);
+        if (s < best) { best = s; memcpy(cen, c2, sizeof(double) * NA * k); memcpy(asg, a2, sizeof(int) * n); *iters = it; }
+    }
+    return best;
+}
+
+static void kmeans_demo(int *asg_out, double cen_out[][NA]) {
+    printf("=============== 1. SimpleKMeans (k = 3, min-max normalised) ===============\n\n");
+    double cen[10][NA]; int asg[MAXN], iters;
+    double sse = kmeans_best(3, cen, asg, &iters);
+    int cnt[3] = {0};
+    for (int i = 0; i < n; i++) cnt[asg[i]]++;
+    /* order clusters by petal length so the output is stable */
+    int ord[3] = {0, 1, 2};
+    for (int a = 0; a < 3; a++) for (int b = a + 1; b < 3; b++)
+        if (cen[ord[b]][2] < cen[ord[a]][2]) { int t = ord[a]; ord[a] = ord[b]; ord[b] = t; }
+    int remap[3];
+    for (int r = 0; r < 3; r++) remap[ord[r]] = r;
+    for (int i = 0; i < n; i++) asg_out[i] = remap[asg[i]];
+
+    double sse_orig = 0;
+    for (int i = 0; i < n; i++) for (int j = 0; j < NA; j++) {
+        double c = cen[asg[i]][j] * (mx[j] - mn[j]) + mn[j];
+        sse_orig += (X[i][j] - c) * (X[i][j] - c);
+    }
+    printf("Number of iterations: %d\n", iters);
+    printf("Within cluster sum of squared errors: %.4f   (normalised, as WEKA reports)\n", sse);
+    printf("Same SSE in original units          : %.4f\n\n", sse_orig);
+    printf("Final cluster centroids (original units):\n");
+    printf("%-14s%11s%11s%11s%11s\n", "Attribute", "Full Data", "Cluster0", "Cluster1", "Cluster2");
+    printf("%-14s%11s", "", "(150)");
+    for (int r = 0; r < 3; r++) { char b[16]; snprintf(b, sizeof b, "(%d)", cnt[ord[r]]); printf("%11s", b); }
+    printf("\n");
+    for (int j = 0; j < NA; j++) {
+        double full = 0;
+        for (int i = 0; i < n; i++) full += X[i][j];
+        printf("%-14s%11.4f", aname[j], full / n);
+        for (int r = 0; r < 3; r++) {
+            double c = cen[ord[r]][j] * (mx[j] - mn[j]) + mn[j];
+            printf("%11.4f", c);
+            cen_out[r][j] = c;
+        }
+        printf("\n");
+    }
+    classes_to_clusters(asg_out, 3);
+
+    printf("\n--- Choosing k: SSE vs number of clusters (elbow) ---\n");
+    printf("%3s %12s\n", "k", "SSE");
+    for (int k = 1; k <= 6; k++) {
+        double c2[10][NA]; int a2[MAXN], it;
+        printf("%3d %12.4f\n", k, kmeans_best(k, c2, a2, &it));
+    }
+    printf("SSE always falls as k grows; the 'elbow' (here at k = 3) is where the drop levels off.\n");
+}
+
+/* ======================= EM (Gaussian mixture, diagonal) ================== */
+static void em_demo(const int *init_asg) {
+    printf("\n\n=============== 2. EM (Gaussian mixture, k = 3, diagonal covariance) ===============\n\n");
+    const int K = 3;
+    double w[3], mu[3][NA], var[3][NA], r[MAXN][3];
+    /* initialise from the k-means partition */
+    for (int c = 0; c < K; c++) {
+        int cnt = 0; double s[NA] = {0}, ss[NA] = {0};
+        for (int i = 0; i < n; i++) if (init_asg[i] == c) { cnt++; for (int j = 0; j < NA; j++) { s[j] += X[i][j]; ss[j] += X[i][j] * X[i][j]; } }
+        w[c] = (double)cnt / n;
+        for (int j = 0; j < NA; j++) {
+            mu[c][j] = s[j] / cnt;
+            var[c][j] = ss[j] / cnt - mu[c][j] * mu[c][j];
+            if (var[c][j] < 1e-4) var[c][j] = 1e-4;
+        }
+    }
+    double ll = -DBL_MAX, prev; int it;
+    for (it = 1; it <= 300; it++) {
+        prev = ll; ll = 0;
+        for (int i = 0; i < n; i++) {                    /* E-step */
+            double lp[3], m = -DBL_MAX;
+            for (int c = 0; c < K; c++) {
+                lp[c] = log(w[c]);
+                for (int j = 0; j < NA; j++)
+                    lp[c] += -0.5 * log(2 * M_PI * var[c][j]) - 0.5 * (X[i][j] - mu[c][j]) * (X[i][j] - mu[c][j]) / var[c][j];
+                if (lp[c] > m) m = lp[c];
+            }
+            double s = 0;
+            for (int c = 0; c < K; c++) s += exp(lp[c] - m);
+            for (int c = 0; c < K; c++) r[i][c] = exp(lp[c] - m) / s;
+            ll += m + log(s);
+        }
+        if (fabs(ll - prev) < 1e-7) break;
+        for (int c = 0; c < K; c++) {                    /* M-step */
+            double nk = 0;
+            for (int i = 0; i < n; i++) nk += r[i][c];
+            w[c] = nk / n;
+            for (int j = 0; j < NA; j++) {
+                double m = 0, v = 0;
+                for (int i = 0; i < n; i++) m += r[i][c] * X[i][j];
+                m /= nk;
+                for (int i = 0; i < n; i++) v += r[i][c] * (X[i][j] - m) * (X[i][j] - m);
+                mu[c][j] = m; var[c][j] = v / nk < 1e-4 ? 1e-4 : v / nk;
+            }
+        }
+    }
+    printf("EM converged after %d iterations\nLog likelihood: %.4f\n\n", it, ll);
+    printf("%-14s%12s%12s%12s\n", "", "Cluster0", "Cluster1", "Cluster2");
+    printf("%-14s", "Prior");
+    for (int c = 0; c < K; c++) printf("%12.4f", w[c]);
+    printf("\n");
+    for (int j = 0; j < NA; j++) {
+        char b[32]; snprintf(b, sizeof b, "%s mean", aname[j]);
+        printf("%-14.14s", b);
+        for (int c = 0; c < K; c++) printf("%12.4f", mu[c][j]);
+        printf("\n");
+        snprintf(b, sizeof b, "%s std", aname[j]);
+        printf("%-14.14s", b);
+        for (int c = 0; c < K; c++) printf("%12.4f", sqrt(var[c][j]));
+        printf("\n");
+    }
+    int asg[MAXN], cnt[3] = {0};
+    for (int i = 0; i < n; i++) {
+        int b = 0;
+        for (int c = 1; c < K; c++) if (r[i][c] > r[i][b]) b = c;
+        asg[i] = b; cnt[b]++;
+    }
+    printf("\nClustered instances (hard assignment): %d, %d, %d\n", cnt[0], cnt[1], cnt[2]);
+    printf("Soft membership of instances 0, 70 and 120:\n");
+    int show[3] = {0, 70, 120};
+    for (int s = 0; s < 3; s++) printf("  instance %3d: %.4f  %.4f  %.4f\n", show[s], r[show[s]][0], r[show[s]][1], r[show[s]][2]);
+    classes_to_clusters(asg, 3);
+}
+
+/* ================================ DBSCAN ================================== */
+static int region(int p, double eps, int *out) {
+    int m = 0;
+    for (int q = 0; q < n; q++) if (sqrt(d2z(Z[p], Z[q])) <= eps) out[m++] = q;
+    return m;
+}
+
+/* labels: -2 = noise, 0.. = cluster id. returns number of clusters */
+static int dbscan(double eps, int minpts, int *lab) {
+    int cid = 0, inq[MAXN] = {0};
+    for (int i = 0; i < n; i++) lab[i] = -1;
+    for (int i = 0; i < n; i++) {
+        if (lab[i] != -1) continue;
+        int nb[MAXN], m = region(i, eps, nb);
+        if (m < minpts) { lab[i] = -2; continue; }
+        int queue[MAXN * 4], qh = 0, qt = 0;
+        lab[i] = cid;
+        for (int j = 0; j < m; j++) if (!inq[nb[j]]) { inq[nb[j]] = 1; queue[qt++] = nb[j]; }
+        while (qh < qt) {
+            int s = queue[qh++];
+            if (lab[s] == -2) lab[s] = cid;               /* border point */
+            if (lab[s] != -1) continue;
+            lab[s] = cid;
+            int nb2[MAXN], m2 = region(s, eps, nb2);
+            if (m2 >= minpts)
+                for (int j = 0; j < m2; j++) if (!inq[nb2[j]]) { inq[nb2[j]] = 1; queue[qt++] = nb2[j]; }
+        }
+        cid++;
+    }
+    return cid;
+}
+
+static void dbscan_demo(void) {
+    printf("\n\n=============== 3. DBSCAN (normalised Euclidean distance) ===============\n\n");
+    printf("--- Parameter sweep, minPoints = 5 ---\n");
+    printf("%6s %9s %7s\n", "eps", "clusters", "noise");
+    double eps_list[] = {0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 0.30};
+    for (int e = 0; e < 7; e++) {
+        int lab[MAXN], k = dbscan(eps_list[e], 5, lab), noise = 0;
+        for (int i = 0; i < n; i++) if (lab[i] == -2) noise++;
+        printf("%6.2f %9d %7d\n", eps_list[e], k, noise);
+    }
+    double eps = 0.12; int minpts = 5, lab[MAXN];
+    int k = dbscan(eps, minpts, lab);
+    printf("\nChosen: eps = %.2f, minPoints = %d  ->  %d clusters\n\n", eps, minpts, k);
+    int tab[NC][8] = {{0}};
+    int noise = 0;
+    for (int i = 0; i < n; i++) { int col = lab[i] == -2 ? 0 : lab[i] + 1; tab[Y[i]][col]++; if (lab[i] == -2) noise++; }
+    printf("%-18s%7s", "", "noise");
+    for (int c = 0; c < k; c++) printf("%7s%d", "clus", c);
+    printf("\n");
+    for (int c = 0; c < ncls; c++) {
+        printf("%-18s", cname[c]);
+        for (int j = 0; j <= k; j++) printf("%8d", tab[c][j]);
+        printf("\n");
+    }
+    printf("\nNoise points: %d. DBSCAN needs no k and flags low-density points as noise.\n", noise);
+    printf("The result is very sensitive to eps: the sweep above goes from 0 clusters to 5,\n");
+    printf("and larger eps values leave only 2 clusters, so eps/minPoints must be tuned.\n");
+}
+
+/* ===================== Knowledge-Flow style pipeline ====================== */
+typedef struct {
+    const char *name;
+    void (*train)(const int *idx, int m);
+    int  (*predict)(const double *x);
+} Classifier;
+
+static int zr_class;
+static void zeror_train(const int *idx, int m) {
+    int cnt[NC] = {0};
+    for (int i = 0; i < m; i++) cnt[Y[idx[i]]]++;
+    zr_class = 0;
+    for (int c = 1; c < ncls; c++) if (cnt[c] > cnt[zr_class]) zr_class = c;
+}
+static int zeror_predict(const double *x) { (void)x; return zr_class; }
+
+static int nn_train_idx[MAXN], nn_m;
+static void nn_train(const int *idx, int m) { memcpy(nn_train_idx, idx, m * sizeof(int)); nn_m = m; }
+static int nn_predict(const double *x) {
+    double best = DBL_MAX; int bc = 0;
+    for (int t = 0; t < nn_m; t++) {
+        double s = 0;
+        for (int j = 0; j < NA; j++) { double d = (x[j] - X[nn_train_idx[t]][j]) / (mx[j] - mn[j]); s += d * d; }
+        if (s < best) { best = s; bc = Y[nn_train_idx[t]]; }
+    }
+    return bc;
+}
+
+static void run_flow(const Classifier *clf, int folds, double *acc_out) {
+    printf("\n[ArffLoader] loaded %d instances\n", n);
+    printf("[CrossValidationFoldMaker] %d stratified folds\n", folds);
+    printf("[Classifier] %s\n", clf->name);
+    printf("[ClassifierPerformanceEvaluator] evaluating...\n");
+    int perm[MAXN], fold[MAXN];
+    for (int i = 0; i < n; i++) perm[i] = i;
+    srand(1);
+    for (int i = n - 1; i > 0; i--) { int j = rand() % (i + 1); int t = perm[i]; perm[i] = perm[j]; perm[j] = t; }
+    int pos = 0;
+    for (int c = 0; c < ncls; c++) for (int i = 0; i < n; i++) if (Y[perm[i]] == c) fold[perm[i]] = (pos++) % folds;
+
+    int cm[NC][NC] = {{0}};
+    for (int f = 0; f < folds; f++) {
+        int train[MAXN], nt = 0;
+        for (int i = 0; i < n; i++) if (fold[i] != f) train[nt++] = i;
+        clf->train(train, nt);
+        for (int i = 0; i < n; i++) if (fold[i] == f) cm[Y[i]][clf->predict(X[i])]++;
+    }
+    int ok = 0, row[NC] = {0}, col[NC] = {0};
+    for (int a = 0; a < ncls; a++) for (int b = 0; b < ncls; b++) { row[a] += cm[a][b]; col[b] += cm[a][b]; }
+    for (int c = 0; c < ncls; c++) ok += cm[c][c];
+    double po = (double)ok / n, pe = 0;
+    for (int c = 0; c < ncls; c++) pe += ((double)row[c] / n) * ((double)col[c] / n);
+    double kappa = (1 - pe) > 1e-12 ? (po - pe) / (1 - pe) : 0;
+    printf("[TextViewer]\n");
+    printf("  Correctly classified : %d / %d  (%.4f %%)\n  Kappa statistic      : %.4f\n", ok, n, 100 * po, kappa);
+    for (int a = 0; a < ncls; a++) {
+        printf("  ");
+        for (int b = 0; b < ncls; b++) printf("%5d", cm[a][b]);
+        printf(" | %s\n", cname[a]);
+    }
+    *acc_out = 100 * po;
+}
+
+static void flow_demo(void) {
+    printf("\n\n=============== 4. Knowledge Flow pipeline + ZeroR baseline ===============\n");
+    printf("\nFlow: ArffLoader -> CrossValidationFoldMaker -> Classifier -> ClassifierPerformanceEvaluator -> TextViewer\n");
+    Classifier zr = {"ZeroR (predict the majority class)", zeror_train, zeror_predict};
+    Classifier nn = {"IBk, k = 1 (nearest neighbour)", nn_train, nn_predict};
+    double a1, a2;
+    run_flow(&zr, 10, &a1);
+    run_flow(&nn, 10, &a2);
+    printf("\n--- Baseline comparison ---\n%-12s %8.2f %%\n%-12s %8.2f %%\n", "ZeroR", a1, "1-NN", a2);
+    printf("Any sensible classifier must beat ZeroR; 1-NN improves on the baseline by %.2f points.\n", a2 - a1);
+}
+
+/* ================================ main ==================================== */
+int main(int argc, char **argv) {
+    if (!load_csv(argc > 1 ? argv[1] : "iris.csv")) { fprintf(stderr, "Cannot read iris.csv\n"); return 1; }
+    int asg[MAXN]; double cen[3][NA];
+    kmeans_demo(asg, cen);
+    em_demo(asg);
+    dbscan_demo();
+    flow_demo();
+    return 0;
+}
